@@ -1,0 +1,35 @@
+[package]
+name = "un7z"
+version = "2.0.0"
+edition = "2021"
+authors = ["Antz"]
+description = "Modern batch extraction tool for multipart archives with beautiful CLI"
+license = "MIT"
+
+[dependencies]
+# CLI argument parsing
+clap = { version = "4.5", features = ["derive"] }
+
+# Progress bars and spinners
+indicatif = "0.17"
+
+# Terminal styling
+console = "0.15"
+termcolor = "1.4"
+
+# Regex support
+regex = "1.10"
+
+# File system operations
+walkdir = "2.4"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Date/time
+chrono = "0.4"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
