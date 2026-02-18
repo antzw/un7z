@@ -2,10 +2,11 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use pty::fork::Fork;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
@@ -228,9 +229,46 @@ fn parse_selection(input: &str, max: usize) -> Result<Vec<usize>> {
     Ok(selected)
 }
 
+/// Run a command using PTY so it thinks it's in a real terminal
+/// This makes unrar/7zz display percentage progress
+fn run_with_pty(cmd: &mut Command) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    // Create fork using from_ptmx
+    let fork = Fork::from_ptmx().context("Failed to create PTY")?;
+
+    // Handle child process
+    if let Ok(mut _slave) = fork.is_child() {
+        let err = cmd.exec();
+        return Err(anyhow::anyhow!("exec failed: {:?}", err));
+    }
+
+    // Handle parent process
+    let mut master = match fork.is_parent() {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+
+    // Forward output from PTY to stdout
+    let mut buf = [0u8; 8192];
+    loop {
+        match master.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let _ = std::io::stdout().write_all(&buf[..n]);
+                let _ = std::io::stdout().flush();
+            }
+            Err(_) => break,
+        }
+    }
+
+    fork.wait()?;
+    Ok(())
+}
+
 fn extract_archive(
     archive: &Archive,
-    multi_progress: &MultiProgress,
+    _multi_progress: &MultiProgress,
     test: bool,
     password: &Option<String>,
     force: bool,
@@ -267,55 +305,54 @@ fn extract_archive(
         }
     }
 
-    // Create spinner (not a progress bar since we can't get real-time progress from unrar/7z)
-    let pb = multi_progress.add(ProgressBar::new(1));
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")
-            .unwrap(),
-    );
-    pb.set_message(format!("Extracting: {}", base_name));
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
-    // Run command
-    let status = if test {
-        pb.set_message(format!("Testing: {}", base_name));
-        let mut cmd = archive.extract_command(true, password);
-
-        if cfg!(not(debug_assertions)) {
-            cmd.stderr(Stdio::piped());
-            cmd.stdout(Stdio::piped());
-        }
-
-        let status = cmd.status()?;
-
-        pb.finish_with_message(format!("{} Tested", style(base_name).green()));
-        status
+    // Print what we're about to do
+    if test {
+        println!(
+            "{} {}",
+            style("⟳").cyan(),
+            style(format!("Testing: {}", base_name)).cyan()
+        );
     } else {
-        pb.set_message(format!("Extracting: {}", base_name));
+        println!(
+            "{} {}",
+            style("⟳").cyan(),
+            style(format!("Extracting: {}", base_name)).cyan()
+        );
+    }
+
+    // Run command with PTY for real progress display
+    let result = if test {
+        let mut cmd = archive.extract_command(true, password);
+        run_with_pty(&mut cmd)
+    } else {
         let mut cmd = archive.extract_command(false, password);
-
-        if cfg!(not(debug_assertions)) {
-            cmd.stderr(Stdio::piped());
-            cmd.stdout(Stdio::piped());
-        }
-
-        let status = cmd.status()?;
-
-        if status.success() {
-            pb.finish_with_message(format!("{} Done", style(base_name).green()));
-        } else {
-            pb.abandon_with_message(format!("{} Failed", style(base_name).red()));
-        }
-
-        status
+        run_with_pty(&mut cmd)
     };
 
-    if !status.success() {
+    // Handle result
+    match &result {
+        Ok(()) => {
+            println!(
+                "{} {}",
+                style("✓").green(),
+                style(base_name).green()
+            );
+        }
+        Err(e) => {
+            println!(
+                "{} {}",
+                style("✗").red(),
+                style(base_name).red()
+            );
+            println!("  {} Error: {}", style("┖─").dim(), e);
+        }
+    }
+
+    if result.is_err() {
         if Path::new(base_name).exists() {
             fs::remove_dir_all(base_name)?;
         }
-        anyhow::bail!("Extraction failed with status: {:?}", status.code());
+        return result;
     }
 
     Ok(())
