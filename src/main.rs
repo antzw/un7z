@@ -233,31 +233,48 @@ fn extract_archive(
     multi_progress: &MultiProgress,
     test: bool,
     password: &Option<String>,
+    force: bool,
 ) -> Result<()> {
     let base_name = &archive.base_name;
 
-    // Check if already extracted
-    if Path::new(base_name).exists() {
-        println!(
-            "{} {}",
-            style("⊘").yellow(),
-            style(base_name).yellow(),
-        );
-        println!("  {} Already exists, skipping", style("┖─").dim());
-        return Ok(());
+    // Check if already extracted (but skip this check if force is enabled)
+    if !force && Path::new(base_name).exists() {
+        // Check if the directory contains actual files (not just empty stubs)
+        let has_valid_files = WalkDir::new(base_name)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_type().is_file()
+                    && e.metadata().map(|m| m.len() > 0).unwrap_or(false)
+            });
+
+        if has_valid_files {
+            println!(
+                "{} {}",
+                style("⊘").yellow(),
+                style(base_name).yellow(),
+            );
+            println!("  {} Already exists with valid files, skipping", style("┖─").dim());
+            return Ok(());
+        } else {
+            println!(
+                "{} {}",
+                style("⚠").yellow(),
+                style(base_name).yellow(),
+            );
+            println!("  {} Exists but appears incomplete, re-extracting", style("┖─").dim());
+            fs::remove_dir_all(base_name)?;
+        }
     }
 
-    // Create progress bar
-    let pb = multi_progress.add(ProgressBar::new(100));
+    // Create spinner (not a progress bar since we can't get real-time progress from unrar/7z)
+    let pb = multi_progress.add(ProgressBar::new(1));
     pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-            .unwrap()
-            .progress_chars("=>-"),
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap(),
     );
-    pb.set_message(format!("{}...", base_name));
-
-    // Show spinner for operation
+    pb.set_message(format!("Extracting: {}", base_name));
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
     // Run command
@@ -367,7 +384,7 @@ fn main() -> Result<()> {
     for i in &indices {
         let archive = &archives[*i];
 
-        match extract_archive(archive, &multi_progress, args.test, &args.password) {
+        match extract_archive(archive, &multi_progress, args.test, &args.password, false) {
             Ok(()) => {
                 success += 1;
             }
