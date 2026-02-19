@@ -1,6 +1,6 @@
 [package]
 name = "un7z"
-version = "2.0.3"
+version = "2.1.0"
 edition = "2021"
 authors = ["Antz"]
 description = "Modern batch extraction tool for multipart archives with beautiful CLI"
@@ -36,3 +36,6 @@ thiserror = "1.0"
 
 # PTY for real progress display
 pty = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

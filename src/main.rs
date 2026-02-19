@@ -33,14 +33,14 @@ struct Args {
     verbose: bool,
 }
 
-struct Archive {
-    path: PathBuf,
-    base_name: String,
-    archive_type: ArchiveType,
+pub(crate) struct Archive {
+    pub path: PathBuf,
+    pub base_name: String,
+    pub archive_type: ArchiveType,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum ArchiveType {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArchiveType {
     SevenZip,
     Zip,
     Rar,
@@ -48,7 +48,7 @@ enum ArchiveType {
 }
 
 impl Archive {
-    fn new(path: PathBuf) -> Option<Self> {
+    pub(crate) fn new(path: PathBuf) -> Option<Self> {
         let file_name = path.file_name()?.to_str()?;
         let (archive_type, base_name) = Self::parse_type(file_name)?;
 
@@ -57,6 +57,14 @@ impl Archive {
             base_name,
             archive_type,
         })
+    }
+
+    /// Returns the directory where files will be extracted (parent of archive + base_name).
+    pub(crate) fn extract_dir(&self) -> Result<PathBuf> {
+        self.path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Archive has no parent"))
+            .map(|p| p.join(&self.base_name))
     }
 
     fn parse_type(filename: &str) -> Option<(ArchiveType, String)> {
@@ -117,6 +125,11 @@ impl Archive {
                     cmd.arg("-p-");
                 }
 
+                // Specify output directory for RAR
+                if !test {
+                    cmd.arg(&self.base_name);
+                }
+
                 cmd
             }
             ArchiveType::TarGz => {
@@ -126,7 +139,8 @@ impl Archive {
                     cmd
                 } else {
                     let mut cmd = Command::new("tar");
-                    cmd.arg("xzf").arg(&self.path);
+                    // Extract to base_name directory
+                    cmd.arg("xzf").arg(&self.path).arg("-C").arg(&self.base_name);
                     cmd
                 }
             }
@@ -134,10 +148,13 @@ impl Archive {
     }
 }
 
-fn scan_archives(dir: &Path) -> Result<Vec<Archive>> {
+pub(crate) fn scan_archives(dir: &Path) -> Result<Vec<Archive>> {
+    let dir = dir
+        .canonicalize()
+        .context("Cannot resolve scan directory")?;
     let mut archives = Vec::new();
 
-    for entry in WalkDir::new(dir)
+    for entry in WalkDir::new(&dir)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -231,15 +248,52 @@ fn parse_selection(input: &str, max: usize) -> Result<Vec<usize>> {
 
 /// Run a command using PTY so it thinks it's in a real terminal
 /// This makes unrar/7zz display percentage progress
-fn run_with_pty(cmd: &mut Command) -> Result<()> {
+fn run_with_pty(cmd: &mut Command, archive_path: &Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
+
+    // Change to the directory containing the archive
+    let archive_dir = archive_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Cannot get parent directory"))?
+        .canonicalize()
+        .context("Cannot canonicalize archive directory")?;
+
+    // Get the archive filename (without path) for use after changing directory
+    let archive_name = archive_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Cannot get archive filename"))?;
 
     // Create fork using from_ptmx
     let fork = Fork::from_ptmx().context("Failed to create PTY")?;
 
     // Handle child process
     if let Ok(mut _slave) = fork.is_child() {
-        let err = cmd.exec();
+        // Change directory before exec
+        std::env::set_current_dir(archive_dir)?;
+
+        // Build new command, replacing the full archive path with just the filename
+        let program = cmd.get_program();
+        let mut new_cmd = std::process::Command::new(program);
+
+        // Find and replace the archive path argument with filename
+        let mut found_archive = false;
+        for arg in cmd.get_args() {
+            if arg == archive_path.as_os_str() {
+                // This is the archive path, replace with filename
+                new_cmd.arg(archive_name);
+                found_archive = true;
+            } else {
+                // Keep other arguments as-is
+                new_cmd.arg(arg);
+            }
+        }
+
+        // If we didn't find the archive path, something is wrong
+        if !found_archive {
+            return Err(anyhow::anyhow!("Archive path not found in command arguments"));
+        }
+
+        let err = new_cmd.exec();
         return Err(anyhow::anyhow!("exec failed: {:?}", err));
     }
 
@@ -279,11 +333,12 @@ fn extract_archive(
     force: bool,
 ) -> Result<()> {
     let base_name = &archive.base_name;
+    let extract_dir = archive.extract_dir()?;
 
     // Check if already extracted (but skip this check if force is enabled)
-    if !force && Path::new(base_name).exists() {
+    if !force && extract_dir.exists() {
         // Check if the directory contains actual files (not just empty stubs)
-        let has_valid_files = WalkDir::new(base_name)
+        let has_valid_files = WalkDir::new(&extract_dir)
             .into_iter()
             .filter_map(|e| e.ok())
             .any(|e| {
@@ -306,8 +361,13 @@ fn extract_archive(
                 style(base_name).yellow(),
             );
             println!("  {} Exists but appears incomplete, re-extracting", style("┖─").dim());
-            fs::remove_dir_all(base_name)?;
+            fs::remove_dir_all(&extract_dir)?;
         }
+    }
+
+    // Tar requires the target directory to exist before extraction
+    if !test && matches!(archive.archive_type, ArchiveType::TarGz) {
+        fs::create_dir_all(&extract_dir)?;
     }
 
     // Print what we're about to do
@@ -328,10 +388,10 @@ fn extract_archive(
     // Run command with PTY for real progress display
     let result = if test {
         let mut cmd = archive.extract_command(true, password);
-        run_with_pty(&mut cmd)
+        run_with_pty(&mut cmd, &archive.path)
     } else {
         let mut cmd = archive.extract_command(false, password);
-        run_with_pty(&mut cmd)
+        run_with_pty(&mut cmd, &archive.path)
     };
 
     // Handle result
@@ -354,8 +414,8 @@ fn extract_archive(
     }
 
     if result.is_err() {
-        if Path::new(base_name).exists() {
-            fs::remove_dir_all(base_name)?;
+        if extract_dir.exists() {
+            fs::remove_dir_all(&extract_dir)?;
         }
         return result;
     }
@@ -370,7 +430,7 @@ fn main() -> Result<()> {
     println!(
         "\n{} {} {}",
         style("un7z").bold().cyan(),
-        style("v2.0").dim(),
+        style(format!("v{}", env!("CARGO_PKG_VERSION"))).dim(),
         style("- Modern Batch Extraction").cyan()
     );
 
@@ -466,4 +526,66 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_archive_new_and_extract_dir() {
+        // Archive in subdirectory: extract_dir should be parent/base_name
+        let archive = Archive::new(PathBuf::from("a/b/c/archive.7z.001")).unwrap();
+        assert_eq!(archive.base_name, "archive");
+        assert_eq!(archive.archive_type, ArchiveType::SevenZip);
+        let extract_dir = archive.extract_dir().unwrap();
+        assert_eq!(extract_dir, PathBuf::from("a/b/c/archive"));
+
+        // Tar.gz in root
+        let archive2 = Archive::new(PathBuf::from("foo.tar.gz")).unwrap();
+        assert_eq!(archive2.base_name, "foo");
+        assert_eq!(archive2.archive_type, ArchiveType::TarGz);
+        let extract_dir2 = archive2.extract_dir().unwrap();
+        assert_eq!(extract_dir2, PathBuf::from("foo"));
+
+        // Unrecognized extensions return None
+        assert!(Archive::new(PathBuf::from("other.txt")).is_none());
+    }
+
+    #[test]
+    fn test_scan_archives_finds_subfolder_archives() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp_path = temp.path();
+
+        // Create temp/subdir/file.7z.001
+        let subdir = temp_path.join("subdir");
+        fs::create_dir_all(&subdir).unwrap();
+        let archive_path = subdir.join("file.7z.001");
+        fs::write(&archive_path, "dummy").unwrap();
+
+        let archives = scan_archives(temp_path).unwrap();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[0].base_name, "file");
+        assert!(archives[0].path.ends_with("file.7z.001"));
+        assert!(archives[0].path.parent().unwrap().ends_with("subdir"));
+    }
+
+    #[test]
+    fn test_tar_extract_dir_created_before_extraction() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp_path = temp.path();
+
+        // Create a minimal tar.gz file path structure
+        let subdir = temp_path.join("nested");
+        fs::create_dir_all(&subdir).unwrap();
+        let archive_path = subdir.join("data.tar.gz");
+        fs::write(&archive_path, "").unwrap(); // Empty file, just for path test
+
+        let archive = Archive::new(archive_path.clone()).unwrap();
+        let extract_dir = archive.extract_dir().unwrap();
+        assert_eq!(extract_dir, subdir.join("data"));
+        assert!(!extract_dir.exists());
+        fs::create_dir_all(&extract_dir).unwrap();
+        assert!(extract_dir.exists());
+    }
 }
