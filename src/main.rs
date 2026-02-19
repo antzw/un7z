@@ -262,8 +262,13 @@ fn run_with_pty(cmd: &mut Command) -> Result<()> {
         }
     }
 
-    fork.wait()?;
-    Ok(())
+    // Wait for child process and check exit status
+    let exit_code = fork.wait()?;
+    if exit_code == 0 {
+        Ok(())
+    } else {
+        anyhow::bail!("Command failed with exit code: {}", exit_code)
+    }
 }
 
 fn extract_archive(

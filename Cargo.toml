@@ -1,6 +1,6 @@
 [package]
 name = "un7z"
-version = "2.0.2"
+version = "2.0.3"
 edition = "2021"
 authors = ["Antz"]
 description = "Modern batch extraction tool for multipart archives with beautiful CLI"
