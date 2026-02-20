@@ -329,11 +329,54 @@ fn run_with_pty(cmd: &mut Command, archive_path: &Path) -> Result<()> {
     }
 
     // Wait for child process and check exit status
-    let exit_code = fork.wait()?;
-    if exit_code == 0 {
+    // On Unix, wait() returns the raw wait status; decode to get actual exit code or signal
+    let raw_status = fork.wait()?;
+    if raw_status == 0 {
         Ok(())
     } else {
-        anyhow::bail!("Command failed with exit code: {}", exit_code)
+        let reason = decode_wait_status(raw_status);
+        anyhow::bail!("{}", reason)
+    }
+}
+
+/// Decode Unix wait status into a human-readable string (actual exit code or signal).
+fn decode_wait_status(raw: i32) -> String {
+    #[cfg(unix)]
+    {
+        const WIFEXITED_MASK: i32 = 0x7F;
+        const WEXITSTATUS_SHIFT: i32 = 8;
+        if (raw & WIFEXITED_MASK) == 0 {
+            let code = (raw >> WEXITSTATUS_SHIFT) & 0xFF;
+            let hint = exit_code_hint(code);
+            if hint.is_empty() {
+                format!("Command failed with exit code {}", code)
+            } else {
+                format!("Command failed with exit code {} ({})", code, hint)
+            }
+        } else {
+            let sig = raw & 0x7F;
+            format!("Command killed by signal {} (raw wait status: {})", sig, raw)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        format!("Command failed with status {}", raw)
+    }
+}
+
+/// Short hint for common unrar/7zz exit codes to help diagnose failed.log.
+fn exit_code_hint(code: i32) -> &'static str {
+    match code {
+        0 => "success",
+        1 => "warning (non-fatal)",
+        2 => "fatal error",
+        3 => "checksum error / damaged data",
+        6 => "file open error (missing part?)",
+        10 => "no files matching",
+        11 => "wrong password",
+        50 => "unrar 50 (often: missing next volume .part02.rar etc)",
+        255 => "user break",
+        _ => "",
     }
 }
 
