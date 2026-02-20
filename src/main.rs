@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::Local;
 use clap::Parser;
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -45,6 +46,17 @@ pub(crate) enum ArchiveType {
     Zip,
     Rar,
     TarGz,
+}
+
+impl ArchiveType {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ArchiveType::SevenZip => "7z",
+            ArchiveType::Zip => "zip",
+            ArchiveType::Rar => "rar",
+            ArchiveType::TarGz => "tar.gz",
+        }
+    }
 }
 
 impl Archive {
@@ -325,6 +337,31 @@ fn run_with_pty(cmd: &mut Command, archive_path: &Path) -> Result<()> {
     }
 }
 
+/// Append a detailed failure entry to failed.log for later inspection.
+fn log_failed_archive(archive: &Archive, err: &anyhow::Error) {
+    let log_path = "failed.log";
+    let Ok(mut file) = OpenOptions::new().append(true).create(true).open(log_path) else {
+        return;
+    };
+    let ts = Local::now().format("%Y-%m-%d %H:%M:%S");
+    // Full error chain (anyhow {:#} shows causes)
+    let err_text = format!("{:#}", err);
+    let entry = format!(
+        "---\n\
+         time: {}\n\
+         path: {}\n\
+         base_name: {}\n\
+         type: {}\n\
+         error: {}\n",
+        ts,
+        archive.path.display(),
+        archive.base_name,
+        archive.archive_type.as_str(),
+        err_text.replace('\n', " "),
+    );
+    let _ = writeln!(file, "{}", entry);
+}
+
 fn extract_archive(
     archive: &Archive,
     _multi_progress: &MultiProgress,
@@ -498,11 +535,7 @@ fn main() -> Result<()> {
                     style(archive.base_name.clone()).red(),
                     e
                 );
-
-                // Log to failed.log
-                if let Ok(mut file) = OpenOptions::new().append(true).create(true).open("failed.log") {
-                    let _ = writeln!(file, "{}", archive.path.display());
-                }
+                log_failed_archive(archive, &e);
             }
         }
     }
